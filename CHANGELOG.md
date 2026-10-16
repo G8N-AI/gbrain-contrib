@@ -10,6 +10,196 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.265.0] - 2026-10-16
+
+**Your brain can now keep a permanent, append-only record of what it believed and when, so a later question like "what did we think about Acme in March?" has a real answer.** Today a page edit overwrites the old facts, takes and links, and the old version is gone unless a backup happens to hold it. This release adds a belief ledger: every time a page's facts, takes, links or timeline change, the change is written as an event, in the same transaction as the write itself, with who wrote it and how much it was trusted. Nothing is recorded until you switch it on for a source, and a brain that never does pays one tiny lookup per write and stores nothing new. Nothing reads the ledger for answers yet; this release lays the record down so the next one can answer from it.
+
+### How to turn it on
+
+```bash
+gbrain beliefs enable --source <id>      # baselines every page (resumable), then records each change
+gbrain beliefs status                    # coverage, watermark, certified or not, drift, restore gaps
+gbrain beliefs backfill --source <id>    # optional: best-effort history from retained page versions
+gbrain beliefs disable --source <id>     # stop recording; enabling again starts a new interval
+```
+
+On a managed source the record is certified: every write goes through one coordinator, so a missing event shows up as drift. On an unmanaged source it is recorded but never certified. `gbrain doctor` reports coverage as `belief_ledger_coverage` and offers `gbrain beliefs reconcile` when a source drifts.
+
+### What it costs (in-transaction ledger work, 4-core box)
+
+| Write | PGLite | Postgres |
+|---|---|---|
+| Typical page edit | about 3 ms of 35 to 45 ms (7 to 8%) | about 3 ms of 31 ms (about 10%) |
+| Large page edit | about 14 ms of 160 to 175 ms (8 to 9%) | about 14 ms of 120 to 130 ms (11 to 12%) |
+| Large page create | about 6% | about 8% |
+
+Bulk work with recording on, 1000 typical pages, end-to-end:
+
+| Run | PGLite off to on | Postgres off to on |
+|---|---|---|
+| `gbrain import` | 5.7 to 7.1 s | 7.1 to 9.6 s |
+| Re-import, every page edited | 6.3 to 7.6 s | 7.4 to 9.4 s |
+| Managed sync, new pages | 24.8 to 27.6 s (+11%) | 15.1 to 18.7 s (+24%) |
+| Managed sync, every page edited | 29.2 to 32.7 s (+12%) | within noise |
+| `gbrain beliefs enable` | 1.2 s | 1.8 s |
+| `gbrain beliefs backfill` (two prior versions per page) | 9.7 s | 7.3 s |
+
+### Things to watch
+
+- **Managed sync on Postgres costs about 24% more for new pages** with recording on. That's above where we want it; a follow-up release targets it.
+- **Purging a page now locks its whole source while it publishes**, so other writes to that source wait: on a 10,000-page source, a median of 353 ms on Postgres (1.4 s for a very large page) and 1.25 s on PGLite (3.2 s for a very large page).
+- **A purge removes a claim from active memory and from the ledger's history, not from every copy.** The ledger keeps an unsalted fingerprint of a purged claim, as purge tombstones already did, so anyone holding a backup can confirm a guess of its exact text.
+- **Retention cleanup is not a purge.** On a managed brain, `gbrain pages purge-deleted` no longer writes purge tombstones; only `gbrain delete <slug> --purge` and `purge_fact` forget content.
+
+## To take advantage of v0.60.265.0
+
+`gbrain upgrade` applies migration v249, which adds the empty ledger tables and one index on facts (built online on Postgres). Nothing records until you run `gbrain beliefs enable`.
+
+1. **If the upgrade did not finish:** `gbrain apply-migrations --yes`.
+2. **To start recording:** `gbrain beliefs enable --source <id>`, then `gbrain beliefs status`.
+3. **Verify:** `gbrain doctor --json` shows `belief_ledger_coverage` as information (off) or ok (recording).
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`, `~/.gbrain/upgrade-errors.jsonl` if it exists, and which step broke.
+
+### Itemized changes
+
+- **Migration v249** adds `belief_events`, `belief_page_lifetimes`, `belief_commit_marks`, `belief_retier_manifest`, `belief_redactions`, `sources.purge_epoch` and `idx_facts_belief_stream`. All tables start empty.
+- **One finalization point** (`src/core/belief/ledger.ts` `withBeliefBatch`): single and grouped publication read the touched pages' state before and after the projections, append the difference under the held page keys, and mark the commit. Logical keys survive renames and merges through page lifetimes; a page's first event is one creation snapshot.
+- **Trust tiers on every event**: lower-tier destructive rewrites are recorded as contested, tier lowering propagates and is never promoted automatically, and an owner `trust confirm` that releases a redacted field appends `redaction.released`.
+- **Purge redaction** (`src/core/belief/purge.ts`, `purge-mirror.ts`): a purge redacts every field that carried the claim, records the request in a register, and writes a purge-mirror line so `gbrain beliefs replay-purges` can re-apply newer purges after a Postgres restore; a restore without them is flagged.
+- **Coverage** (`coverage.ts`, `coverage-report.ts`): enable baselines every page under its page key and sets the watermark; disable during an enable ends the run uncertified; a stopped ledger stays stopped across restores.
+- **History backfill** (`backfill.ts`) reads `page_versions` only, records historical time separately from recorded time, and is never certified.
+- **State read** (`state.ts`) is one statement per batch side, uses indexed link, transition and fact selection, and runs with a transaction-local generic plan so bulk imports stop re-planning it per page.
+- **Doctor `belief_ledger_coverage`**: intervals, certification, baseline progress, drift (sampled; complete under `--tier deep`), unmarked publications and partial purge replays; `--fix` reconciles.
+- Design and the full list of W1 deviations: `docs/designs/BELIEF_LEDGER.md` (section 13).
+
+### For contributors
+
+- Tests: `test/belief-ledger-*.test.ts` run every probe from the design's section 11 on PGLite and Postgres.
+
+## [0.60.264.0] - 2026-10-16
+
+**A write right after creating a very large page no longer has to wait out a doubled re-index (switch-on behavior only; no change with `pages.segmented_storage` off, the default).** With segmented storage on, creating a page over 1 MiB indexed it twice at once: once right after the write and once from the background job the write queued. Each pass held a database connection for every batch, and on a small connection pool the next write could miss its 5-second wait and come back `write_pending`. Now only one pass per page runs at a time in a process, and a page that's already indexed is skipped. No data was ever at risk: the shrink path versions the old body and demotes the page in one transaction.
+
+### Itemized changes
+
+- **One projection per page per process** (`page-body/projection.ts`): a second call for the same page waits for the first, and a sealed page returns at once.
+- **Forced probe** in `test/large-pages/segmented-derived-work.test.ts`: holding the first projection open shows 2 concurrent projections of one page on master and 1 with the fix, on PGLite and Postgres. Fixes the nightly race-hunt failure #6143.
+
+## [0.60.263.0] - 2026-10-16
+
+**A managed source no longer stays blocked forever on a "conflict" with a page that does not exist.** On a managed brain, a sync could end `BLOCKED` with `revision_conflict` on `__managed_sync_checkpoint__`, and every sync after it ended the same way: doctor's `sync_freshness` failed for good, `gbrain sources refresh` refused with `sync_in_progress`, and the printed fix said to read a page that `gbrain get` cannot find (#6834). That slug is the sync's own bookkeeping, not a page. The refusal meant another run (in practice an older gbrain, which kept one cursor per writer and option set, so two cursors of one source could race) had already moved the source's commit checkpoint, so this run's checkpoint could never publish. Now a run whose source already stands at its target finishes on the next plain sync, and one whose source moved anywhere else is named by doctor with a preview-first repair. No page content was ever at risk.
+
+### What you'd see
+
+| Situation | Before | Now |
+|---|---|---|
+| The source's `last_commit` already equals the stuck run's target (the usual case: two cursors raced to the same commit) | every sync: `Sync BLOCKED ... revision_conflict ... slug: "__managed_sync_checkpoint__"` | the next plain sync finishes the run (`synced`) and clears the failure |
+| `last_commit` moved to some other commit | blocked forever; every repair channel reported nothing to repair | still blocked, but `gbrain repair managed-sync-orphans --source <id>` lists the cursor as `checkpoint_moved`; after its apply the next sync discovers from the recorded commit. Doctor `sync_failures` and `sync_freshness` name that repair as their fix |
+| The receipt's fix (`gbrain sync` output, `gbrain write-request`) | "Read the current page and review the intended change" | reason `sync_checkpoint_moved`: bookkeeping, not a page, and the step that finishes or retires the run |
+| The terminal-failure action for the refused checkpoint receipt | `gbrain get --source <id> -- __managed_sync_checkpoint__` (page_not_found) | `gbrain sync status --source <id> --json`; a later committed checkpoint of the source supersedes the receipt |
+| A fact-extraction batch refused on `__managed_facts_complete__` ("Some extracted facts have not committed.") | "Read the current page ..." | reason `facts_batch_incomplete`: the batch's completion record, not a page; the facts that committed stay, and the action inspects the receipt |
+
+### If a source is stuck now
+
+On this release: run `gbrain sync --source <id> --no-pull`. If it still ends blocked on `__managed_sync_checkpoint__`, preview and apply the repair doctor names:
+
+```bash
+gbrain repair managed-sync-orphans --source <id>                        # preview: lists the cursor as checkpoint_moved; writes nothing
+gbrain repair managed-sync-orphans --source <id> --apply --expect <hash>
+gbrain sync --source <id> --no-pull                                      # discovers from the source's recorded commit
+```
+
+On v0.60.255.0 through v0.60.262.0 (one cursor per source): `gbrain sync --source <id> --no-pull --retry-failed`, with the options the stuck run used (`resume_argv` in `gbrain sync status --source <id> --json`), rediscovers from the recorded commit and unblocks the source. On older releases, where a writer's sync reads only its own cursor, upgrade first.
+
+### Itemized changes
+
+- **Checkpoint at its target (#6834).** A managed-sync checkpoint refused "The source checkpoint changed during this sync." whose source now records exactly the run's target is revived marked overtaken (the #5522 rule the publication already applies), within the existing per-invocation revival bound. A checkpoint moved to any other commit stays refused: publishing it would move the source's commit backwards or past work nobody imported.
+- **`checkpoint_moved` orphans (#6834).** `classifyManagedSyncOrphans` lists an unfinished cursor whose checkpoint is that refusal, whose pages all committed, whose source records a commit other than the run's start and target, and with no open or recovering request under its key; for a path slice short of its target's end (#6349), any commit other than the run's start qualifies, since that checkpoint never moves `last_commit`. `retireManagedSyncOrphan` re-checks the same rule in the delete and binds it to the previewed run and checkpoint request, so a cursor whose source reached its target after the preview, or a run that replaced the previewed one under the same key, is kept (`no_longer_orphaned`). Retiring a path slice clears its slice record too, so the next discovery starts from the recorded commit instead of resuming that slice against it. Bookkeeping rows only (`op_checkpoints`); no page or file changes, nothing at upgrade.
+- **Doctor (#6834).** `sync_failures` sets `fix` to `gbrain repair managed-sync-orphans [--source <id>]` whenever it lists orphans. `sync_freshness` sets the same `fix` (and names it in the message) for a stale managed source with a `checkpoint_moved` cursor, instead of a plain sync that would block again.
+- **Diagnostics (#6834).** `writeFailureDiagnostic` gives the moved-checkpoint and incomplete-fact-batch refusals their own reasons and suggestions. `classifyTerminal` keeps both in `caller_conflict` but with class `systemic` and an action that reads sync status (checkpoint) or the receipt (fact batch), never `gbrain get` on a bookkeeping slug. The supersession rule counts a later committed checkpoint of the source as superseding a refused one. A page whose slug merely looks like a bookkeeping slug keeps the page diagnosis: the request's own kind (or, once compacted, its operation) decides. Ordinary page conflicts are unchanged.
+- `test/persistence-sync-failures.serial.test.ts` produced its checkpoint failure by moving `last_commit` to the run's own target, which now finishes; it moves it to a commit outside the run instead.
+- Tests: `test/sync-checkpoint-moved-6834.test.ts` (PGLite and Postgres) builds the race with two older cursor keys, a brain that already carries the refused receipt and failure row, a checkpoint moved elsewhere, a path slice, and a run replaced between preview and apply; it fails on v0.60.262.0 (every plain sync blocked, no orphan listed, the page fix printed) and passes here.
+- No schema change.
+
+## [0.60.262.0] - 2026-10-16
+
+**One purged item no longer stops a whole Google sync, a source whose syncs keep dying now says so, and Claude refusals through `claude-cli` stop being retried forever.** If you purged a page that a connector keeps listing (a recurring calendar event whose future occurrences you deleted with `--purge`, while the series stays on the calendar), the next sync that reached it ended there. Every sync after it died the same way, so nothing more from that account was imported: no new mail, contacts or events. And every status surface said the source was fine. Now the purged item is skipped and recorded, as the purge intends, and the rest of the sync goes through. Separately, when Claude refused a prompt under its usage policy through the `claude-cli` model provider, atom extraction counted it as an ordinary error and sent the same page back to the model on every run; it now takes the same bounded give-up path as other providers' refusals.
+
+### What you'd see
+
+| Situation | Before | Now |
+|---|---|---|
+| A Google or GitHub connector lists an item whose content you purged | the whole sync job dies with `purged_content`, and so does every later one | the item is skipped and listed in `gbrain sources status` ("skipped as purged content"); everything else imports and the cursor moves on |
+| A connector source's syncs keep ending on an error | `sync status`: `last_error: null`, `needs_human: false`; doctor `sync_freshness` ok until 24 h passed | `sources status` and `sync status` name the error, the item and a read-only next step; after 3 failed runs in a row the source reads STOPPED in both, and doctor `sync_freshness` warns (fails once the last good sync is past the fail age) |
+| `claude-cli` answers "API Error: <model> can't help with this ... https://www.anthropic.com/legal/aup" during `extract_atoms` | counted as a generic error; the page is re-sent on every run and never given up on | treated as a content block (`claude_cli_usage_policy`); after the usual consecutive-failure limit the page is tombstoned and stops costing calls |
+
+### If a Google source is stuck now
+
+Upgrade to this release; the next sync skips the purged occurrence by itself and imports the backlog. Nothing to clear, no flags.
+
+On an older release you can unblock it by hand: `gbrain pages purges list` names the purged slugs, and `gbrain pages unpurge <slug>` for the occurrence the failing job names lets that one occurrence back in so the sync can finish. Each week the next purged occurrence of the series enters the 60-day calendar window and stops the source again, so the lasting fix on an older release is ending the series (or deleting its future occurrences) in Google Calendar itself.
+
+### Itemized changes
+
+- **Per-item purged skip (#6831).** A managed connector page import whose content matches one of the source's page purge tombstones is skipped before admission (`ManagedConnectorSync.carriesPurgedPage`, same content hash the pages guard compares). If the guard still refuses at publication (`failed` / `purged_content`, for example a purge that landed mid-run), that refusal is skipped the same way, wherever it surfaces: the item's own wait, the pending set at the end of the run, or the pending set a previous run left. A skipped item is not a receipt the checkpoint waits on and is not counted as imported. A replayed refusal stays skipped, under `--retry-failed` too, while its tombstone stands; once `gbrain pages unpurge` cleared it, the next run retries the item once by itself. Every other failed receipt still fails the run, as before. Covers every connector on this path: Google contacts, calendar and Gmail, and GitHub.
+- **Run failures recorded (#6831).** The connector state row records the error a run ended on (a write refusal, a credential error or any other error, except a lost lease or the caller's own deadline or cancel; `last_failure`: code, message, item slug and request when the run ended on an item's receipt, time, and the count of runs in a row that ended that way); only a complete run clears it. It also keeps the 20 most recent purged skips (`purged_items`) and the run's `last_run.purged_skipped` count.
+- **Status surfaces (#6831).** `gbrain sources status` (human and `--json` `connector.last_failure`, `connector.stopped`, `connector.purged_items`); `gbrain sync status --json` gains `connector_last_error` (with `class`, `safe_actions`, `needs_human` and a read-only `fix`). `last_error`, `state`, `next`, the managed-sync cursor and its resume command are unchanged for connector sources. Doctor `sync_freshness` reports a connector source with 3 or more failed runs in a row as STOPPED. A run counts as failed when it ends on any error other than a lost lease or the caller's deadline or cancel; only a complete run clears the record, so a partial or wait-budget stop leaves it as it was. Recording needs managed persistence (`connector_state` exists only there).
+- **`claude-cli` refusals (#6816).** `providerContentBlockReason` recognizes the `claude-cli` adapter's usage-policy refusal: the `claude-cli reported error: API Error:` prefix with no API status, the usage-policy link, and one of the refusal phrases Claude Code has used ("can't help with this", "safeguards flagged this", "violate our Usage Policy"). Any other `claude-cli` error is unchanged. With `chat_fallback_on_refusal: false`, such a refusal is no longer sent on to the next model in `chat_fallback_chain`.
+- Tests: `test/connector-purged-item-6831.test.ts` (PGLite) and `test/e2e/connector-purged-item-6831.test.ts` (Postgres) fail on v0.60.260.0 with `purged_content` ending the run and pass here; `test/claude-cli-refusal-6816.test.ts` runs the real adapter and gateway against a stub CLI.
+- No schema change.
+
+## [0.60.261.0] - 2026-10-16
+
+**Auto-update no longer blocklists the next release.** While master was ahead of the latest published release, the `auto` channel targeted master's unreleased `VERSION`, `bun update` changed nothing, the swap still reported success and relaunched, and the relaunch recorded the unreleased version as known-bad, so that release was never installed automatically once it shipped. Update checks now follow the published release, a swap that installs nothing is not a swap, and one command clears the bad entries an earlier release left behind (#6828, #6718).
+
+### If auto-update skipped a release on your install
+
+`gbrain doctor` shows `self_upgrade_health` warning `Auto-upgrade skips <version> as known-bad, but it was never installed`. On this release:
+
+```bash
+gbrain self-upgrade --clear-never-installed           # preview: each entry and the swap that recorded it; changes nothing
+gbrain self-upgrade --clear-never-installed --apply   # removes exactly those entries
+```
+
+Only an entry proven never installed is listed: the no-op swap's own `last_upgrade` record (same version as `from` and `to`, written during that swap) must still be there, so only the most recent such entry can be proven, and a release that really installed and then crashed stays known-bad. An older entry shows under "Kept"; clear it by hand as below once you have confirmed it. If your install is still on an earlier release, it may be skipping this release as known-bad too: upgrade by hand with `gbrain self-upgrade` (a manual upgrade does not consult the known-bad list), or read the list with `gbrain config get self_upgrade.failed_versions` and, for an entry you have confirmed was never installed (no `v<version>` tag existed when it was recorded), set the list without it with `gbrain config set self_upgrade.failed_versions '[...]'`.
+
+### What you'd see
+
+| Situation | Before | Now |
+|---|---|---|
+| Master's `VERSION` is ahead of `latest-stable` | `UPGRADE_AVAILABLE` and doctor announced master's version; `auto` tried to install it | the published release is announced; nothing to install until it ships |
+| `gbrain upgrade` where the install step changes nothing | `Upgrade complete. Now running: <same version>`; `last_upgrade` overwritten with `<v> -> <v>` | `No newer version was installed: still running gbrain <v>.`; `last_upgrade` kept |
+| `auto` swap that installs nothing (a moving tag already at its head, an exact-tag pin) | `swapped; exiting for supervisor relaunch`, then `crash-on-launch ... (recorded known-bad)` for a version never installed | stays up, audits `skipped: nothing newer was installed`, records nothing known-bad, retries after 24 hours |
+| A new release installs and does not start | the attempted version recorded known-bad | the installed version recorded known-bad (unchanged when they are the same) |
+| Exact-tag pin with no newer published tag | the reinstall hint could name master's unpublished `#v<VERSION>`, and the `upgrade_errors` warn never cleared | the hint moves the install off the pin, and the warn clears once the binary moves past the version it failed from |
+
+### Itemized changes
+
+- `gbrain check-update`, the startup marker refresh, `gbrain self-upgrade` and the `auto` channel read `VERSION` and `CHANGELOG.md` at the `latest-stable` tag (`src/commands/check-update.ts`).
+- `gbrain upgrade` compares the version after the install step with the one running; an unchanged version skips `last_upgrade`, `JUST_UPGRADED`, the cache reset and the post-swap smoke. With `GBRAIN_SWAP_RECEIPT` set (the `auto` channel sets it), it writes what it installed (`installed`, `not_installed`, `installed_broken`).
+- The `auto` channel reads that receipt (or `gbrain --version` when there is none): nothing installed, or no newer version confirmed, holds without known-bad and sets `self_upgrade.last_check_ts` (one attempt a day); a failure records the installed version, and when that is not the checked version also throttles and drops the update cache; a real swap points the relaunch breadcrumb at the installed version (`src/core/self-upgrade-swap.ts`). Before swapping it checks the version the install would get against the known-bad list.
+- The pinned-install fallback no longer reads the update cache for its target, so it never names an unpublished version (#6718).
+- `gbrain self-upgrade --clear-never-installed [--apply] [--json]` and the `self_upgrade_health` warn with its fix (`src/core/self-upgrade-recovery.ts`).
+- `upgrade_errors` treats a record whose target is not a version as superseded once the binary is newer than its `from` version and the schema is current.
+- No schema change.
+
+## [0.60.260.0] - 2026-10-16
+
+**An approved `doctor --remediate --include-repairs` run no longer fails with `preview_changed` because autovacuum analyzed a table between the preview and the run.** Hotfix for LHF wave 2 item 6 (GBRA-107, reported by GBRA-101).
+
+### What you'd see
+
+| Situation | Before | Now |
+|---|---|---|
+| Postgres autoanalyzes a table (or collects an expression index's statistics) between `doctor --remediation-plan` and the approved `--remediate --include-repairs --expect <plan_hash>` | refused with `preview_changed`; the approval had to be repeated | runs; planner-stats applies whatever is pending at run time |
+| A new pending repair appears between preview and run | `preview_changed` | `preview_changed` (unchanged) |
+
+### Itemized changes
+
+- `RepairKindSpec.approval: 'unbound'` leaves a kind out of the remediation approval's plan_hash. planner-stats is the one such kind: it plans from live server statistics that autovacuum changes on its own schedule, and its ANALYZE changes no stored record. Every other repair kind stays bound by its pending count.
+- `test/e2e/remediate-planner-stats-approval.test.ts`: an ANALYZE between approval and run fails on v0.60.259.0 with `preview_changed` and passes here; a new orphan connector checkpoint between approval and run still refuses.
+- No schema change.
+
 ## [0.60.259.0] - 2026-10-16
 
 **Remote Postgres searches take about half the time, typed searches stop paying for JIT compilation, `tokenmax` `query` stops expanding by default, and a new harness proves a performance change leaves every answer the same.** This is LHF wave 2 (GBRA-107), the second low-hanging-fruit wave on search latency, retrieval and cost. Every performance item below was checked against master with the new contract-parity harness: on PGLite and Postgres, every remote response block, `_meta` field and database write is identical; only timings differ.
