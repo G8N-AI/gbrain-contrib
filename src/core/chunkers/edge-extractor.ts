@@ -71,6 +71,13 @@ export interface ExtractedEdge {
    * (gbrain-evals N13-8: `segments.join("/")` resolved to pathe's `join`).
    */
   memberCall?: true;
+  /**
+   * Ruby: the caller's lexical nesting (`Module.nesting`, innermost first),
+   * set when `toSymbol` starts with a relative constant this file does not
+   * define. The resolver qualifies it against the source's class and module
+   * chunks (symbol-resolver.ts).
+   */
+  rubyNesting?: string[];
 }
 
 /**
@@ -524,6 +531,82 @@ function rubyCallContext(call: any): RubyCallContext | null {
   return { nesting, self: self ?? null };
 }
 
+/** What a Ruby call resolves to; `nesting` rides along when a relative constant is left for the resolver. */
+export interface RubyCallee {
+  symbol: string;
+  nesting?: string[];
+}
+
+/** Nodes that start a fresh set of local variables (Ruby scope gates). */
+const RUBY_SCOPE_GATES = new Set(['program', 'method', 'singleton_method', 'class', 'module', 'singleton_class']);
+/** Blocks see the locals around them and add their own. */
+const RUBY_BLOCKS = new Set(['block', 'do_block', 'lambda']);
+const RUBY_PARAMETER_PARENTS = new Set([
+  'method_parameters', 'block_parameters', 'lambda_parameters', 'optional_parameter', 'splat_parameter',
+  'hash_splat_parameter', 'keyword_parameter', 'block_parameter', 'destructured_parameter',
+  'left_assignment_list', 'destructured_left_assignment', 'rest_assignment', 'exception_variable',
+]);
+
+const sameNode = (a: any, b: any): boolean => !!a && !!b && a.id === b.id;
+
+/** True when `ident` declares a local: an assignment target, a parameter, a rescue variable, a `for` variable or a pattern variable. */
+function rubyBindsLocal(ident: any): boolean {
+  const parent = ident.parent;
+  if (!parent) return false;
+  if (RUBY_PARAMETER_PARENTS.has(parent.type)) return true;
+  if (parent.type === 'assignment' || parent.type === 'operator_assignment') return sameNode(parent.childForFieldName('left'), ident);
+  if (parent.type === 'for') return sameNode(parent.childForFieldName('pattern'), ident);
+  for (let p = parent, child = ident; p; child = p, p = p.parent) {
+    if (p.type === 'in_clause') return sameNode(p.childForFieldName('pattern'), child);
+    if (RUBY_SCOPE_GATES.has(p.type) || RUBY_BLOCKS.has(p.type)) return false;
+  }
+  return false;
+}
+
+/** True when `ident` is read as a value, not a name in a definition, call, alias or binding. */
+function rubyReadsValue(ident: any): boolean {
+  const parent = ident.parent;
+  if (!parent || parent.type === 'alias' || parent.type === 'undef') return false;
+  if (parent.type === 'call' && sameNode(parent.childForFieldName('method'), ident)) return false;
+  if ((parent.type === 'method' || parent.type === 'singleton_method') && sameNode(parent.childForFieldName('name'), ident)) return false;
+  return !rubyBindsLocal(ident);
+}
+
+/** True when `scope` declares local `name` before byte `before`, outside nested blocks and scope gates. */
+function rubyDeclaresBefore(scope: any, name: string, before: number): boolean {
+  const stack: any[] = [...(scope.namedChildren ?? [])];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node.startIndex >= before) continue;
+    if (node.type === 'identifier' && node.text === name && rubyBindsLocal(node)) return true;
+    // A block's parameters and assignments belong to the block; a gate's to the gate.
+    if (RUBY_SCOPE_GATES.has(node.type) || RUBY_BLOCKS.has(node.type)) continue;
+    for (const child of node.namedChildren ?? []) stack.push(child);
+  }
+  return false;
+}
+
+/**
+ * Ruby decides at parse time that a bare name is a local variable when an
+ * assignment or parameter of that name appears earlier in its scope: the
+ * enclosing blocks out to the nearest `def` / `class` / `module`. tree-sitter-ruby
+ * does not record that (an assigned `x` and an unknown `y` are both
+ * `identifier`), so the rule is applied here. Unknown past WALK_DEPTH_CAP
+ * hops counts as a local, so no edge is emitted.
+ */
+function rubyIsLocal(ident: any): boolean {
+  let scope = ident.parent;
+  for (let hops = 0; scope; scope = scope.parent, hops++) {
+    if (hops >= WALK_DEPTH_CAP) return true;
+    const gate = RUBY_SCOPE_GATES.has(scope.type);
+    if (gate || RUBY_BLOCKS.has(scope.type)) {
+      if (rubyDeclaresBefore(scope, ident.text, ident.startIndex)) return true;
+      if (gate) return false;
+    }
+  }
+  return false;
+}
+
 /**
  * Ruby receiver resolution. A Ruby call usually names its receiver in the
  * syntax, so the edge can carry the name the chunker gives the callee
@@ -541,13 +624,19 @@ function rubyCallContext(call: any): RubyCallContext | null {
  *   new(...).m  in `def self.x`    → <scope>#m  (`def self.call = new(...).call`)
  *
  * A relative constant takes Ruby's lexical lookup over the enclosing
- * `class`/`module` nesting, innermost first, but only against constants this
- * file defines: `Client` inside `module Gbrain` becomes `Gbrain::Client` when
- * the file defines it and stays `Client` otherwise, because which definition
- * Ruby picks then depends on files the extractor cannot see. A receiverless
- * call to a method the file does not define (`render`, `validates`, `puts`)
- * keeps its bare token. Every other shape returns null, and the caller emits
- * the bare token as before.
+ * `class`/`module` nesting, innermost first, against constants this file
+ * defines: `Client` inside `module Gbrain` becomes `Gbrain::Client` when the
+ * file defines it. Otherwise it stays `Client` and the edge carries the
+ * nesting, so the resolver can finish the lookup against the other files of
+ * the source. A receiverless call to a method the file does not define
+ * (`render`, `validates`, `puts`) keeps its bare token. Every other shape
+ * returns null, and the caller emits the bare token as before.
+ *
+ * A zero-argument call written without parentheses (`attempt { configuration }`)
+ * parses as an identifier, which may equally be a local variable. `bareCall`
+ * emits it only when Ruby's parse-time rule says it is not a local (no
+ * assignment or parameter of that name earlier in its scope) and this file
+ * defines the method there.
  *
  * Definitions are collected once per tree, from class and module bodies only
  * (not from blocks or method bodies), the same places the chunker emits
@@ -557,32 +646,45 @@ function rubyCallContext(call: any): RubyCallContext | null {
  */
 export class RubyScope {
   private defs: Set<string> | null = null;
+  private methodNames: Set<string> | null = null;
 
   constructor(private readonly root: any) {}
 
-  qualify(call: any, callee: string): string | null {
+  qualify(call: any, callee: string): RubyCallee | null {
     const ctx = rubyCallContext(call);
     if (!ctx) return null;
     const receiver = call.childForFieldName('receiver');
     if (!receiver || receiver.type === 'self') {
       const scope = ctx.nesting[0];
       if (!scope || !ctx.self) return null;
-      if (callee === 'new') return ctx.self === 'class' ? scope : null;
+      if (callee === 'new') return ctx.self === 'class' ? { symbol: scope } : null;
       const target = `${scope}${ctx.self === 'instance' ? '#' : '.'}${callee}`;
-      return this.definitions().has(target) ? target : null;
+      return this.definitions().has(target) ? { symbol: target } : null;
     }
     if (receiver.type === 'constant' || receiver.type === 'scope_resolution') {
       const constant = this.constant(receiver.text, ctx.nesting);
       if (!constant) return null;
-      return callee === 'new' ? constant : `${constant}.${callee}`;
+      return callee === 'new' ? constant : { ...constant, symbol: `${constant.symbol}.${callee}` };
     }
     const instanceOf = this.constructed(receiver, ctx);
-    return instanceOf ? `${instanceOf}#${callee}` : null;
+    return instanceOf ? { ...instanceOf, symbol: `${instanceOf.symbol}#${callee}` } : null;
+  }
+
+  /** A paren-less zero-argument call (`configuration`): `<scope>#m` / `<scope>.m` when it is not a local and this file defines it. */
+  bareCall(ident: any): string | null {
+    const name = ident.text as string;
+    this.definitions();
+    if (!this.methodNames!.has(name) || !rubyReadsValue(ident)) return null;
+    const ctx = rubyCallContext(ident);
+    const scope = ctx?.nesting[0];
+    if (!scope || !ctx.self) return null;
+    const target = `${scope}${ctx.self === 'instance' ? '#' : '.'}${name}`;
+    return this.definitions().has(target) && !rubyIsLocal(ident) ? target : null;
   }
 
   /** The class `receiver` constructs: `A::B.new(...)`, or `new(...)` / `self.new` / `new` where `self` is the class. */
-  private constructed(receiver: any, ctx: RubyCallContext): string | null {
-    const ownClass = ctx.self === 'class' ? (ctx.nesting[0] ?? null) : null;
+  private constructed(receiver: any, ctx: RubyCallContext): RubyCallee | null {
+    const ownClass = ctx.self === 'class' && ctx.nesting[0] ? { symbol: ctx.nesting[0] } : null;
     // `new.m` without parentheses parses `new` as an identifier.
     if (receiver.type === 'identifier') return receiver.text === 'new' ? ownClass : null;
     if (receiver.type !== 'call' || receiver.childForFieldName('method')?.text !== 'new') return null;
@@ -592,21 +694,26 @@ export class RubyScope {
     return this.constant(cls.text, ctx.nesting);
   }
 
-  /** Ruby's lexical lookup of `written`'s first segment, against this file's definitions; else as written. */
-  private constant(written: string, nesting: string[]): string | null {
+  /**
+   * Ruby's lexical lookup of `written`'s first segment against this file's
+   * definitions. Unresolved and relative: as written, carrying the nesting.
+   */
+  private constant(written: string, nesting: string[]): RubyCallee | null {
     const text = written.replace(/\s+/g, '');
     if (!RUBY_CONSTANT_PATH.test(text)) return null;
-    if (text.startsWith('::')) return text.slice(2);
+    if (text.startsWith('::')) return { symbol: text.slice(2) };
     const [head, ...rest] = text.split('::');
     const defs = this.definitions();
     const owner = nesting.find((cref) => defs.has(`${cref}::${head}`));
-    return owner ? [`${owner}::${head}`, ...rest].join('::') : text;
+    if (owner) return { symbol: [`${owner}::${head}`, ...rest].join('::') };
+    return nesting.length > 0 ? { symbol: text, nesting } : { symbol: text };
   }
 
   /** Constants (`A::B`), instance methods (`A::B#m`) and singleton methods (`A::B.m`) this file defines. */
   private definitions(): Set<string> {
     if (this.defs) return this.defs;
     const defs = new Set<string>();
+    const methodNames = new Set<string>();
     const stack: Array<{ node: any; path: string; singleton: boolean }> = [{ node: this.root, path: '', singleton: false }];
     while (stack.length > 0) {
       const { node, path, singleton } = stack.pop()!;
@@ -624,14 +731,17 @@ export class RubyScope {
           if (path && child.childForFieldName('value')?.type === 'self') stack.push({ node: child, path, singleton: true });
         } else if (child.type === 'method') {
           if (path && name) defs.add(`${path}${singleton ? '.' : '#'}${name}`);
+          if (path && name) methodNames.add(name);
         } else if (child.type === 'singleton_method') {
           if (path && name && child.childForFieldName('object')?.type === 'self') defs.add(`${path}.${name}`);
+          if (path && name) methodNames.add(name);
         } else if (child.type === 'assignment') {
           const left = child.childForFieldName('left');
           if (left?.type === 'constant') defs.add(rubyJoin(path, left.text));
         }
       }
     }
+    this.methodNames = methodNames;
     return (this.defs = defs);
   }
 }
@@ -754,14 +864,19 @@ export function extractCallEdges(tree: any, language: SupportedCodeLanguage): Ex
       if (callee) {
         // v0.34 W1: try receiver-type resolution. On success, emit the
         // qualified name; on miss, emit the bare token (pre-W1 behavior).
-        const qualified = ruby ? ruby.qualify(node, callee) : resolveReceiverType(node, language, callee, fileBindings);
+        const rubyCallee = ruby ? ruby.qualify(node, callee) : null;
+        const qualified = ruby ? (rubyCallee?.symbol ?? null) : resolveReceiverType(node, language, callee, fileBindings);
         out.push({
           callSiteByteOffset: node.startIndex,
           toSymbol: qualified ?? callee,
           edgeType: 'calls',
           ...(!qualified && isMemberCall(node, cfg) ? { memberCall: true as const } : {}),
+          ...(rubyCallee?.nesting ? { rubyNesting: rubyCallee.nesting } : {}),
         });
       }
+    } else if (ruby && node.type === 'identifier') {
+      const target = ruby.bareCall(node);
+      if (target) out.push({ callSiteByteOffset: node.startIndex, toSymbol: target, edgeType: 'calls' });
     }
     // Push children for further traversal.
     for (const child of node.namedChildren) stack.push(child);

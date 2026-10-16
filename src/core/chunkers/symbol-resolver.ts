@@ -56,6 +56,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { chunkVisibleFilter } from '../search/safe-chunks.ts';
+import { codeReadFilter } from '../code-intel/read-scope.ts';
 
 /**
  * Bump this ISO timestamp whenever the extractor or resolver shape
@@ -70,10 +71,12 @@ import { chunkVisibleFilter } from '../search/safe-chunks.ts';
  * 2026-05-14T01:00:00Z — v0.34 W2: edge-extractor now emits `imports`
  * and `references` edges alongside calls. JS/TS/TSX + Python get imports;
  * TS only gets references.
- * 2026-10-16T00:00:00Z — Ruby calls carry the receiver's qualified name
- * (`A::B.m`, `A::B#m`), matching Ruby chunk identities.
+ * 2026-10-16T05:00:00Z — Ruby calls carry the receiver's qualified name
+ * (`A::B.m`, `A::B#m`), matching Ruby chunk identities; paren-less calls emit
+ * edges; relative constants are qualified against the source's class and
+ * module chunks.
  */
-export const EDGE_EXTRACTOR_VERSION_TS = '2026-10-16T00:00:00Z';
+export const EDGE_EXTRACTOR_VERSION_TS = '2026-10-16T05:00:00Z';
 
 export const BATCH_SIZE = 200;
 
@@ -196,6 +199,8 @@ async function processChunkBatch(
     [chunkIds, sourceId],
   );
 
+  await qualifyRubyConstants(engine, sourceId, edges);
+
   // Group edges by from_chunk_id so we know which chunks have which edges.
   const edgesByChunkId = new Map<number, UnresolvedEdgeRow[]>();
   for (const e of edges) {
@@ -292,6 +297,65 @@ async function processChunkBatch(
   );
 
   stats.chunks_walked += chunks.length;
+}
+
+/**
+ * Ruby constants the extractor left relative (`Client.new` inside
+ * `module Gbrain`, with `Client` defined in another file) carry the caller's
+ * nesting in edge_metadata.ruby_nesting. Ruby looks the constant's first
+ * segment up in each enclosing scope, innermost first, before ancestors and
+ * the top level; the first scope whose class or module this source defines
+ * names it, and the edge is renamed to that name (`Gbrain::Client`) so
+ * name-keyed reads (code_callers, the walks) find it. With no nested match
+ * Ruby goes on to ancestors and the top level, which the index cannot settle,
+ * so the written name stays.
+ *
+ * Only class and module chunks of the same source that every reader may see
+ * count (not private, sealed, current), so no edge name depends on a page a
+ * reader cannot read, and the edge stays a name: no resolved_chunk_id
+ * pointing at another page. A caller that already has the edge under its
+ * qualified spelling keeps that row and the relative one is dropped.
+ */
+async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges: UnresolvedEdgeRow[]): Promise<void> {
+  const lookups = edges.flatMap((edge) => {
+    const nesting = edge.edge_metadata?.ruby_nesting;
+    if (!Array.isArray(nesting)) return [];
+    const cut = edge.to_symbol_qualified.search(/[.#]/);
+    const head = (cut === -1 ? edge.to_symbol_qualified : edge.to_symbol_qualified.slice(0, cut)).split('::')[0]!;
+    return [{ edge, head, nesting: nesting.filter((n): n is string => typeof n === 'string') }];
+  });
+  if (lookups.length === 0) return;
+  const names = [...new Set(lookups.flatMap((l) => l.nesting.map((cref) => `${cref}::${l.head}`)))];
+  const rows = await engine.executeRaw<{ symbol_name_qualified: string }>(
+    // chunk-visibility-ok: Ruby class/module candidates: code pages are never segmented (chooseBodyStorage)
+    `SELECT DISTINCT cc.symbol_name_qualified
+       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+      WHERE p.source_id = $1 AND cc.language = 'ruby' AND cc.symbol_type IN ('class', 'module')
+        AND cc.symbol_name_qualified = ANY($2::text[])
+        AND ${codeReadFilter([], { excludePrivate: true, requireSafeChunks: true })}`,
+    [sourceId, names],
+  );
+  const defined = new Set(rows.map((r) => r.symbol_name_qualified));
+  for (const { edge, head, nesting } of lookups) {
+    const owner = nesting.find((cref) => defined.has(`${cref}::${head}`));
+    if (!owner) continue;
+    const renamed = `${owner}::${edge.to_symbol_qualified}`;
+    const updated = await engine.executeRaw<{ id: number }>(
+      `UPDATE code_edges_symbol e
+          SET to_symbol_qualified = $1, edge_metadata = e.edge_metadata - 'ruby_nesting'
+        WHERE e.id = $2
+          AND NOT EXISTS (SELECT 1 FROM code_edges_symbol d
+                           WHERE d.from_chunk_id = e.from_chunk_id AND d.to_symbol_qualified = $1 AND d.edge_type = e.edge_type)
+        RETURNING e.id`,
+      [renamed, edge.id],
+    );
+    if (updated.length > 0) {
+      edge.to_symbol_qualified = renamed;
+      continue;
+    }
+    await engine.executeRaw(`DELETE FROM code_edges_symbol WHERE id = $1`, [edge.id]);
+    edges.splice(edges.indexOf(edge), 1);
+  }
 }
 
 /**

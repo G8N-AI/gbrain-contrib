@@ -8,11 +8,19 @@
  * file alone cannot prove the target, which keep their bare or written token.
  *
  * A zero-argument call written without parentheses (`helper`) parses as an
- * identifier, not a call, and emits no edge; the cases use call syntax.
+ * identifier, the same node a local variable reads as; the last block pins
+ * Ruby's parse-time rule that tells them apart.
  */
 
 import { describe, test, expect } from 'bun:test';
 import { chunkCodeTextFull } from '../src/core/chunkers/code.ts';
+
+/** The call edges of `src` with the nesting each relative constant carries for the resolver. */
+async function nestings(src: string): Promise<Array<[string, string[] | undefined]>> {
+  const { edges } = await chunkCodeTextFull(src, 'app/models/x.rb', {});
+  return edges.filter(e => e.edgeType === 'calls').map(e => [e.toSymbol, e.rubyNesting] as [string, string[] | undefined])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+}
 
 /** The call edges of `src`, sorted, as `toSymbol` plus a `~` marker for an untyped member call. */
 async function callees(src: string): Promise<string[]> {
@@ -134,4 +142,68 @@ end
 `;
     expect(await callees(src)).toEqual(['helper', 'included']);
   });
+
+  test('a relative constant the file does not define carries the nesting; a proven or absolute one does not', async () => {
+    const src = `module Acme
+  class Widget
+    def run
+      Client.fetch(1)
+      Widget.build(1)
+      ::Billing::Ledger.post(1)
+    end
+
+    def self.build(x); end
+  end
+end
+`;
+    expect(await nestings(src)).toEqual([
+      ['Acme::Widget.build', undefined],
+      ['Billing::Ledger.post', undefined],
+      ['Client.fetch', ['Acme::Widget', 'Acme']],
+    ]);
+  });
 });
+
+/** `body` inside `def run(arg)` of Acme::Widget, which also defines `helper`, `arg` and `later` (instance) and `self.klass_only`. */
+const parenless = (body: string) => `module Acme
+  class Widget
+    def run(arg)
+      ${body}
+    end
+
+    def helper; end
+    def arg; end
+    def later; end
+    def self.klass_only; end
+  end
+end
+`;
+
+describe('Ruby paren-less calls', () => {
+  test.each([
+    ['a defined method',                  'helper',                         ['Acme::Widget#helper']],
+    ['inside a block',                    'attempt { helper }',             ['Acme::Widget#helper', 'attempt']],
+    ['as a receiver',                     'helper.size',                    ['Acme::Widget#helper', 'size~']],
+    // Ruby's rule is positional: a local exists only after its assignment.
+    ['assigned after the reference',      'later; later = 1',               ['Acme::Widget#later']],
+    // A local assigned inside one block is not visible after it.
+    ['assigned only inside a block',      'each { helper = 1 }; helper',    ['Acme::Widget#helper', 'each']],
+  ])('%s emits an edge', async (_label, body, expected) => {
+    expect(await callees(parenless(body as string))).toEqual(expected as string[]);
+  });
+
+  test.each([
+    ['an assigned local',                 'helper = 1; helper'],
+    ['a method parameter',                'arg'],
+    ['a block parameter',                 'each { |helper| helper }'],
+    ['an operator-assigned local',        'helper ||= 1; helper'],
+    ['a multiple-assignment local',       'helper, x = 1, 2; helper'],
+    ['a rescue variable',                 'begin; rescue => helper; helper; end'],
+    ['an unknown name',                   'unknown_thing'],
+    ['a singleton method, from an instance method', 'klass_only'],
+  ])('%s emits no edge', async (_label, body) => {
+    const edges = await callees(parenless(body as string));
+    expect(edges.filter(e => e.startsWith('Acme::Widget#'))).toEqual([]);
+  });
+});
+

@@ -75,7 +75,7 @@ for (const kind of testBackends()) {
       await close?.();
     });
     beforeEach(async () => {
-      await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'app/%'`);
+      await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'app-%' OR slug LIKE 'lib-%'`);
       await importCodeFile(engine, 'app/services/acme/health_check.rb', HEALTH_CHECK, { noEmbed: true });
       await importCodeFile(engine, 'app/jobs/acme/health_probe_job.rb', PROBE_JOB, { noEmbed: true });
       await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
@@ -136,6 +136,92 @@ end
       expect(edge?.resolved).toBe(false);
       expect(edge?.edge_metadata.ambiguous).toBe(true);
       expect(edge?.edge_metadata.candidates).toHaveLength(2);
+    });
+
+    test('a paren-less call resolves to its chunk; a local of the same name does not', async () => {
+      await importCodeFile(engine, 'app/models/acme/report.rb', `module Acme
+  class Report
+    def build
+      title = 1
+      attempt { header }
+      title
+    end
+
+    def attempt = yield
+    def header; end
+    def title; end
+  end
+end
+`, { noEmbed: true });
+      await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+      expect(await resolvedCallers('Acme::Report#header')).toEqual(['Acme::Report#build']);
+      expect(await resolvedCallers('Acme::Report#title')).toEqual([]);
+    });
+
+    describe('relative constants defined in another file', () => {
+      const CALLER = `module Acme
+  class Dashboard
+    def show
+      Client.new.ping
+      Ledger.post(1)
+      Widget.build(1)
+    end
+  end
+end
+`;
+      const importLib = (path: string, src: string, opts: { sourceId?: string } = {}) =>
+        importCodeFile(engine, path, src, { noEmbed: true, ...opts });
+      const callees = async () =>
+        (await engine.getCalleesOf('Acme::Dashboard#show', { sourceId: 'default' })).map((e) => e.to_symbol_qualified).sort();
+
+      test('take the nested name Ruby looks up first, from the other files of the source', async () => {
+        await importLib('lib/acme/client.rb', 'module Acme\n  class Client\n    def ping; end\n  end\nend\n');
+        await importLib('lib/acme/ledger.rb', 'class Acme::Ledger\n  def self.post(x); end\nend\n');
+        // Only a top-level Widget exists: Ruby would go on to ancestors and the top level, so the name stays.
+        await importLib('lib/widget.rb', 'class Widget\n  def self.build(x); end\nend\n');
+        await importLib('app/models/acme/dashboard.rb', CALLER);
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect(await callees()).toEqual(['Acme::Client', 'Acme::Client#ping', 'Acme::Ledger.post', 'Widget.build']);
+        const op: any = await handleToolCall(engine, 'code_callers', { symbol: 'Acme::Client#ping' });
+        expect(op.callers.map((e: any) => e.from_symbol_qualified)).toEqual(['Acme::Dashboard#show']);
+        // A renamed edge is settled: it no longer asks the resolver to look it up.
+        expect(op.callers[0].edge_metadata.ruby_nesting).toBeUndefined();
+      });
+
+      test('the innermost scope wins when several define the constant (Ruby lookup order)', async () => {
+        await importLib('lib/acme/client.rb', 'module Acme\n  class Client\n    def ping; end\n  end\nend\n');
+        await importLib('lib/acme/dashboard/client.rb', 'class Acme::Dashboard::Client\n  def ping; end\nend\n');
+        await importLib('app/models/acme/dashboard.rb', CALLER);
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect((await callees()).filter((n) => n.includes('Client'))).toEqual(['Acme::Dashboard::Client', 'Acme::Dashboard::Client#ping']);
+      });
+
+      test('never from a private page or another source', async () => {
+        await importLib('lib/acme/client.rb', 'module Acme\n  class Client\n    def ping; end\n  end\nend\n');
+        await engine.executeRaw(`UPDATE pages SET frontmatter = frontmatter || '{"visibility":"private"}'::jsonb WHERE slug LIKE 'lib%client%'`);
+        // Keep the projection current so the private flag, not a stale projection, is what hides the page.
+        await engine.executeRaw(`UPDATE pages SET text_projection_revision = knowledge_revision WHERE slug LIKE 'lib%client%'`);
+        await engine.executeRaw(`INSERT INTO sources (id, name, local_path, config, created_at) VALUES ('ruby-other', 'ruby-other', '/fake/ruby-other', '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING`);
+        await importLib('lib/acme/ledger.rb', 'class Acme::Ledger\n  def self.post(x); end\nend\n', { sourceId: 'ruby-other' });
+        await importLib('app/models/acme/dashboard.rb', CALLER);
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect(await callees()).toEqual(['Client', 'Client#ping', 'Ledger.post', 'Widget.build']);
+      });
+
+      test('never from unsealed chunks (chunked before the safe fence)', async () => {
+        await importLib('lib/acme/client.rb', 'module Acme\n  class Client\n    def ping; end\n  end\nend\n');
+        await engine.executeRaw(`UPDATE pages SET chunker_version = 0 WHERE slug LIKE 'lib%client%'`);
+        await importLib('app/models/acme/dashboard.rb', CALLER);
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect((await callees()).filter((n) => n.includes('Client'))).toEqual(['Client', 'Client#ping']);
+      });
+
+      test('a caller that also spells the constant in full keeps one edge', async () => {
+        await importLib('lib/acme/client.rb', 'module Acme\n  class Client\n    def self.fetch(x); end\n  end\nend\n');
+        await importLib('app/models/acme/both.rb', 'module Acme\n  class Both\n    def run\n      Client.fetch(1)\n      Acme::Client.fetch(2)\n    end\n  end\nend\n');
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect((await engine.getCalleesOf('Acme::Both#run', { sourceId: 'default' })).map((e) => e.to_symbol_qualified)).toEqual(['Acme::Client.fetch']);
+      });
     });
   });
 }
