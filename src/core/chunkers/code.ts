@@ -572,7 +572,7 @@ export function detectCodeLanguage(filePath: string, content?: string): Supporte
   if (lower.endsWith('.ts') || lower.endsWith('.mts') || lower.endsWith('.cts')) return 'typescript';
   if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) return 'javascript';
   if (lower.endsWith('.py')) return 'python';
-  if (lower.endsWith('.rb')) return 'ruby';
+  if (lower.endsWith('.rb') || lower.endsWith('.rake')) return 'ruby';
   if (lower.endsWith('.go')) return 'go';
   if (lower.endsWith('.rs')) return 'rust';
   if (lower.endsWith('.java')) return 'java';
@@ -1282,7 +1282,8 @@ function collectImmediateNestedChildren(node: any, config: NestedEmitConfig): {
     for (const child of n.namedChildren) {
       if (config.parentTypes.has(child.type)) parents.push(child);
       else if (config.childTypes.has(child.type)) leaves.push(child);
-      if (BODY_NODE_TYPES.has(child.type) || child.type.endsWith('_body')) {
+      // Ruby `class << self` bodies hold singleton methods of the enclosing class.
+      if (BODY_NODE_TYPES.has(child.type) || child.type.endsWith('_body') || isRubySelfSingletonClass(child)) {
         scan(child);
       }
     }
@@ -1290,6 +1291,9 @@ function collectImmediateNestedChildren(node: any, config: NestedEmitConfig): {
   scan(node);
   return { parents, leaves };
 }
+
+const isRubySelfSingletonClass = (node: any): boolean =>
+  node?.type === 'singleton_class' && node.childForFieldName('value')?.type === 'self';
 
 /**
  * v0.20.0 Cathedral II Layer 6 (A3): recursively emit a nested parent
@@ -1355,7 +1359,7 @@ function emitNestedScoped(
       endLine: leaf.endPosition.row + 1,
       index: chunks.length,
       parentSymbolPath: newParentPath,
-      singleton: leaf.type === 'singleton_method',
+      singleton: leaf.type === 'singleton_method' || isRubySelfSingletonClass(leaf.parent?.parent),
     }));
   }
 }

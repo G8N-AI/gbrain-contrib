@@ -308,7 +308,11 @@ async function processChunkBatch(
  * names it, and the edge is renamed to that name (`Gbrain::Client`) so
  * name-keyed reads (code_callers, the walks) find it. With no nested match
  * Ruby goes on to ancestors and the top level, which the index cannot settle,
- * so the written name stays.
+ * so the written name stays. When the caller's own file proved an outer scope
+ * (`Gbrain::Result`), the edge carries that name, the inner scopes Ruby tries
+ * first and the written form (edge_metadata.ruby_written): an inner scope
+ * defined in another file wins, as in Ruby, and otherwise the file's proof
+ * stands.
  *
  * Only class and module chunks of the same source that every reader may see
  * count (not private, sealed, current), so no edge name depends on a page a
@@ -320,9 +324,12 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
   const lookups = edges.flatMap((edge) => {
     const nesting = edge.edge_metadata?.ruby_nesting;
     if (!Array.isArray(nesting)) return [];
+    // `Gbrain::Result.ok?` → constant `Gbrain::Result`, member `.ok?`; the written form wins when recorded.
     const cut = edge.to_symbol_qualified.search(/[.#]/);
-    const head = (cut === -1 ? edge.to_symbol_qualified : edge.to_symbol_qualified.slice(0, cut)).split('::')[0]!;
-    return [{ edge, head, nesting: nesting.filter((n): n is string => typeof n === 'string') }];
+    const member = cut === -1 ? '' : edge.to_symbol_qualified.slice(cut);
+    const recorded = edge.edge_metadata?.ruby_written;
+    const written = typeof recorded === 'string' ? recorded : edge.to_symbol_qualified.slice(0, cut === -1 ? undefined : cut);
+    return [{ edge, written, member, head: written.split('::')[0]!, nesting: nesting.filter((n): n is string => typeof n === 'string') }];
   });
   if (lookups.length === 0) return;
   const names = [...new Set(lookups.flatMap((l) => l.nesting.map((cref) => `${cref}::${l.head}`)))];
@@ -336,13 +343,13 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
     [sourceId, names],
   );
   const defined = new Set(rows.map((r) => r.symbol_name_qualified));
-  for (const { edge, head, nesting } of lookups) {
+  for (const { edge, written, member, head, nesting } of lookups) {
     const owner = nesting.find((cref) => defined.has(`${cref}::${head}`));
     if (!owner) continue;
-    const renamed = `${owner}::${edge.to_symbol_qualified}`;
+    const renamed = `${owner}::${written}${member}`;
     const updated = await engine.executeRaw<{ id: number }>(
       `UPDATE code_edges_symbol e
-          SET to_symbol_qualified = $1, edge_metadata = e.edge_metadata - 'ruby_nesting'
+          SET to_symbol_qualified = $1, edge_metadata = e.edge_metadata - 'ruby_nesting' - 'ruby_written'
         WHERE e.id = $2
           AND NOT EXISTS (SELECT 1 FROM code_edges_symbol d
                            WHERE d.from_chunk_id = e.from_chunk_id AND d.to_symbol_qualified = $1 AND d.edge_type = e.edge_type)

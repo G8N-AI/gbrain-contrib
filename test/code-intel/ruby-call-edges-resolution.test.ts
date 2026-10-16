@@ -158,6 +158,30 @@ end
       expect(await resolvedCallers('Acme::Report#title')).toEqual([]);
     });
 
+    test('a setter call resolves to the setter, never the getter', async () => {
+      await importCodeFile(engine, 'app/models/thermostat.rb',
+        'class Thermostat\n  def bump\n    self.target = 72\n  end\n\n  def target\n    @target\n  end\n\n  def target=(v)\n    @target = v\n  end\nend\n', { noEmbed: true });
+      await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+      expect(await resolvedCallers('Thermostat#target')).toEqual([]);
+      expect(await resolvedCallers('Thermostat#target=')).toEqual(['Thermostat#bump']);
+    });
+
+    test('a def inside a block in a module is not a caller of the module', async () => {
+      await importCodeFile(engine, 'app/services/billing/ledger_reading.rb',
+        'module Billing\n  LedgerReading = Data.define(:amount) do\n    def self.from_record(record)\n      new(amount: record.amount)\n    end\n  end\nend\n', { noEmbed: true });
+      await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+      expect(await resolvedCallers('Billing')).toEqual([]);
+    });
+
+    test('code_flow tags Ruby sinks', async () => {
+      await importCodeFile(engine, 'app/services/acme/fetcher.rb',
+        'module Acme\n  class Fetcher\n    def run(uri)\n      Net::HTTP.get(uri)\n      system("true")\n      File.write("x", "y")\n    end\n  end\nend\n', { noEmbed: true });
+      await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+      const op: any = await handleToolCall(engine, 'code_flow', { entry_point: 'Acme::Fetcher#run' });
+      expect(op.terminal_nodes.map((t: any) => `${t.symbol} ${t.sink_kind}`).sort())
+        .toEqual(['File.write file_io', 'Net::HTTP.get http_call', 'system process_exec']);
+    });
+
     describe('relative constants defined in another file', () => {
       const CALLER = `module Acme
   class Dashboard
@@ -169,7 +193,7 @@ end
   end
 end
 `;
-      const importLib = (path: string, src: string, opts: { sourceId?: string } = {}) =>
+      const importLib = (path: string, src: string, opts: { sourceId?: string; force?: boolean } = {}) =>
         importCodeFile(engine, path, src, { noEmbed: true, ...opts });
       const callees = async () =>
         (await engine.getCalleesOf('Acme::Dashboard#show', { sourceId: 'default' })).map((e) => e.to_symbol_qualified).sort();
@@ -214,6 +238,18 @@ end
         await importLib('app/models/acme/dashboard.rb', CALLER);
         await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
         expect((await callees()).filter((n) => n.includes('Client'))).toEqual(['Client', 'Client#ping']);
+      });
+
+      test('a scope the caller\'s file proves yields to an inner scope defined in another file', async () => {
+        const OWN = 'module Acme\n  class Client; end\n  class Widget\n    def run\n      Client.fetch(1)\n    end\n  end\nend\n';
+        await importLib('app/models/acme/widget.rb', OWN);
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        const widgetCallees = async () => (await engine.getCalleesOf('Acme::Widget#run', { sourceId: 'default' })).map((e) => e.to_symbol_qualified);
+        expect(await widgetCallees()).toEqual(['Acme::Client.fetch']);
+        await importLib('lib/acme/widget/client.rb', 'class Acme::Widget::Client\n  def self.fetch(x); end\nend\n');
+        await importLib('app/models/acme/widget.rb', OWN, { force: true });
+        await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+        expect(await widgetCallees()).toEqual(['Acme::Widget::Client.fetch']);
       });
 
       test('a caller that also spells the constant in full keeps one edge', async () => {

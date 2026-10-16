@@ -148,16 +148,18 @@ end
   class Widget
     def run
       Client.fetch(1)
-      Widget.build(1)
+      Part.build(1)
       ::Billing::Ledger.post(1)
     end
 
-    def self.build(x); end
+    class Part
+      def self.build(x); end
+    end
   end
 end
 `;
     expect(await nestings(src)).toEqual([
-      ['Acme::Widget.build', undefined],
+      ['Acme::Widget::Part.build', undefined],
       ['Billing::Ledger.post', undefined],
       ['Client.fetch', ['Acme::Widget', 'Acme']],
     ]);
@@ -207,3 +209,154 @@ describe('Ruby paren-less calls', () => {
   });
 });
 
+
+/** The calls edges of `src` with their resolver hand-off (`toSymbol`, inner scopes, written form). */
+async function handoffs(src: string): Promise<Array<[string, string[] | undefined, string | undefined]>> {
+  const { edges } = await chunkCodeTextFull(src, 'app/models/x.rb', {});
+  return edges.filter(e => e.edgeType === 'calls').map(e => [e.toSymbol, e.rubyNesting, e.rubyWritten] as [string, string[] | undefined, string | undefined])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+describe('Ruby self context, setters and singleton bodies', () => {
+  test('an assignment through a receiver calls the setter; an operator assignment calls both', async () => {
+    const src = `module Acme
+  class Thermostat
+    def bump
+      self.target = 72
+      self.level += 1
+      Thermostat.mode = 2
+      self.lo, self.hi = 1, 2
+    end
+
+    def target=(v); end
+    def lo=(v); end
+    def hi=(v); end
+    def level; end
+    def level=(v); end
+    def self.mode=(v); end
+  end
+end
+`;
+    expect(await callees(src)).toEqual(['Acme::Thermostat#hi=', 'Acme::Thermostat#level', 'Acme::Thermostat#level=', 'Acme::Thermostat#lo=', 'Acme::Thermostat#target=', 'Acme::Thermostat.mode=']);
+  });
+
+  test('a def inside a block in a module (Data.define do) does not take the module as self', async () => {
+    const src = `module Billing
+  LedgerReading = Data.define(:amount) do
+    def self.from_record(record)
+      new(amount: 1)
+      helper(1)
+    end
+  end
+
+  def self.helper(x); end
+end
+`;
+    expect(await callees(src)).toEqual(['Data.define', 'helper', 'new']);
+  });
+
+  test('instance_eval rebinds self; class << OTHER and def OTHER.m are not this class', async () => {
+    const src = `class Widget
+  def run(obj)
+    obj.instance_eval { helper(1) }
+  end
+
+  class << OTHER
+    def m
+      helper(2)
+    end
+  end
+
+  def OTHER.z
+    helper(3)
+  end
+
+  def helper(x); end
+  def self.helper(x); end
+end
+`;
+    expect(await callees(src)).toEqual(['helper', 'helper', 'helper', 'instance_eval~']);
+  });
+
+  test('class << self: its methods are singleton chunks and call each other as Class.m; its body is not a def', async () => {
+    const src = `class Widget
+  class << self
+    attr_accessor :registry
+    make(0)
+    def build(x)
+      make(1)
+    end
+
+    def make(x); end
+  end
+end
+`;
+    const { chunks } = await chunkCodeTextFull(src, 'app/models/widget.rb', {});
+    expect(chunks.map(c => c.metadata.symbolNameQualified).filter(n => n !== 'Widget')).toEqual(['Widget.build', 'Widget.make']);
+    // In the `class << self` body itself, self is the singleton class, not Widget.
+    expect(await callees(src)).toEqual(['Widget.make', 'attr_accessor', 'make']);
+  });
+
+  test('a singleton method defined only on another object or in class << OTHER does not prove Class.m', async () => {
+    const src = `class Widget
+  def self.run
+    z(1)
+    m(1)
+  end
+
+  def OTHER.z(x); end
+
+  class << OTHER
+    def m(x); end
+  end
+end
+`;
+    expect(await callees(src)).toEqual(['m', 'z']);
+  });
+
+  test('a constant assigned in the class body is found by the lexical lookup', async () => {
+    const src = `class Widget
+  Limits = Struct.new(:max)
+  def run
+    Limits.new(1)
+  end
+end
+`;
+    expect(await callees(src)).toEqual(['Struct', 'Widget::Limits']);
+  });
+
+  test('a class named ::B inside module A is the top-level B', async () => {
+    const src = `module A
+  class ::B
+    def run
+      helper(1)
+    end
+
+    def helper(x); end
+  end
+end
+`;
+    expect(await callees(src)).toEqual(['B#helper']);
+  });
+
+  test('new without a receiver inside an instance method is not the class', async () => {
+    expect(await callees(inWidget('new(1)'))).toEqual(['new']);
+  });
+
+  test('a constant this file proves only in an outer scope hands the inner scopes to the resolver', async () => {
+    const src = `module Acme
+  class Client; end
+  class Widget
+    def run
+      Client.fetch(1)
+    end
+  end
+end
+`;
+    expect(await handoffs(src)).toEqual([['Acme::Client.fetch', ['Acme::Widget'], 'Client']]);
+  });
+
+  test('backticks and %x() are calls to Kernel#`', async () => {
+    expect(await callees(inWidget('`ls`; %x(pwd)'))).toEqual(['`', '`']);
+  });
+});
