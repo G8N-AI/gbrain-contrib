@@ -713,8 +713,8 @@ function rubyCalleeNames(call: any, callee: string): string[] {
  * constant assigned (not `class`/`module`) in another file has no chunk, so
  * the resolver cannot see it: the edge keeps its written name, or takes an
  * outer namesake class when one exists (`Client = Struct.new` inside
- * Gbrain::Widget in one file, `class Gbrain::Client` in another, gives
- * `Gbrain::Client` where Ruby finds `Gbrain::Widget::Client`); methods
+ * Acme::Widget in one file, `class Acme::Client` in another, gives
+ * `Acme::Client` where Ruby finds `Acme::Widget::Client`); methods
  * inside blocks (`Struct.new do`, `class_methods do`) are not chunked.
  *
  * A zero-argument call written without parentheses (`attempt { configuration }`)

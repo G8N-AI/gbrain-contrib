@@ -308,12 +308,12 @@ const RUBY_DEFINITION_FILTER = codeReadFilter([], { excludePrivate: true, requir
 
 /**
  * Ruby constants the extractor could not settle in the caller's innermost
- * scope (`Client.new` inside `module Gbrain`, with `Client` defined in another
+ * scope (`Client.new` inside `module Acme`, with `Client` defined in another
  * file) carry the scopes Ruby tries first (edge_metadata.ruby_nesting) and the
  * constant as written (ruby_written). Ruby looks the constant's first segment
  * up in each of those scopes, innermost first, before ancestors and the top
  * level; the first scope whose class or module this source defines names it,
- * and the edge takes that name (`Gbrain::Client`) so name-keyed reads
+ * and the edge takes that name (`Acme::Client`) so name-keyed reads
  * (code_callers, the walks) find it. With no such scope the edge takes the
  * extractor's own name (ruby_default): the written name, or the outer scope
  * the caller's file proved.
@@ -333,7 +333,7 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
     const meta = edge.edge_metadata;
     const nesting = meta?.ruby_nesting;
     if (!Array.isArray(nesting)) return [];
-    // `Gbrain::Result.ok?` → constant `Gbrain::Result`, member `.ok?`.
+    // `Acme::Result.ok?` → constant `Acme::Result`, member `.ok?`.
     const fallback = typeof meta?.ruby_default === 'string' ? meta.ruby_default : edge.to_symbol_qualified;
     const cut = fallback.search(/[.#]/);
     const member = cut === -1 ? '' : fallback.slice(cut);
