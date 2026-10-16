@@ -202,6 +202,11 @@ describe('Ruby paren-less calls', () => {
     ['a multiple-assignment local',       'helper, x = 1, 2; helper'],
     ['a rescue variable',                 'begin; rescue => helper; helper; end'],
     ['an unknown name',                   'unknown_thing'],
+    // Blocks see the locals around them.
+    ['a local read inside a block',       'helper = 1; each { helper }'],
+    ['a pattern variable',                'case arg; in [helper]; helper; end'],
+    // defined? tests for the method without calling it.
+    ['the operand of defined?',           'defined?(helper)'],
     ['a singleton method, from an instance method', 'klass_only'],
   ])('%s emits no edge', async (_label, body) => {
     const edges = await callees(parenless(body as string));
@@ -360,3 +365,35 @@ end
     expect(await callees(inWidget('`ls`; %x(pwd)'))).toEqual(['`', '`']);
   });
 });
+
+describe('Ruby parameter defaults and implicit block parameters', () => {
+  test('a parameter default is a call; only the parameter name is bound', async () => {
+    const src = `class Widget
+  def run(x = helper, timeout: limit)
+    x
+  end
+
+  def helper; end
+  def limit; end
+end
+`;
+    expect(await callees(src)).toEqual(['Widget#helper', 'Widget#limit']);
+  });
+
+  test('it and _1 in a block without parameters are the implicit parameter; with parameters, it is a call', async () => {
+    const src = `class Widget
+  def run
+    [1].map { it }
+    [1].map { _1 }
+    -> { it }
+    [1].map { |y| it }
+  end
+
+  def it; end
+  def _1; end
+end
+`;
+    expect(await callees(src)).toEqual(['Widget#it', 'map~', 'map~', 'map~']);
+  });
+});
+

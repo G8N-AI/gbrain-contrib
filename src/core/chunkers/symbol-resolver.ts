@@ -71,12 +71,13 @@ import { codeReadFilter } from '../code-intel/read-scope.ts';
  * 2026-05-14T01:00:00Z — v0.34 W2: edge-extractor now emits `imports`
  * and `references` edges alongside calls. JS/TS/TSX + Python get imports;
  * TS only gets references.
- * 2026-10-16T05:00:00Z — Ruby calls carry the receiver's qualified name
+ * 2026-10-16T08:00:00Z — Ruby calls carry the receiver's qualified name
  * (`A::B.m`, `A::B#m`), matching Ruby chunk identities; paren-less calls emit
  * edges; relative constants are qualified against the source's class and
- * module chunks.
+ * module chunks, and re-qualified whenever the source's Ruby definitions
+ * change.
  */
-export const EDGE_EXTRACTOR_VERSION_TS = '2026-10-16T05:00:00Z';
+export const EDGE_EXTRACTOR_VERSION_TS = '2026-10-16T08:00:00Z';
 
 export const BATCH_SIZE = 200;
 
@@ -131,6 +132,8 @@ export async function resolveSymbolEdgesIncremental(
     batches: 0,
     ms: 0,
   };
+
+  await refreshRubyConstantEdges(engine, opts.sourceId);
 
   let processed = 0;
   while (processed < maxChunks) {
@@ -299,37 +302,42 @@ async function processChunkBatch(
   stats.chunks_walked += chunks.length;
 }
 
+/** Only definitions every reader may see name an edge: not private, sealed, current. */
+const RUBY_DEFINITION_FILTER = codeReadFilter([], { excludePrivate: true, requireSafeChunks: true });
+
 /**
- * Ruby constants the extractor left relative (`Client.new` inside
- * `module Gbrain`, with `Client` defined in another file) carry the caller's
- * nesting in edge_metadata.ruby_nesting. Ruby looks the constant's first
- * segment up in each enclosing scope, innermost first, before ancestors and
- * the top level; the first scope whose class or module this source defines
- * names it, and the edge is renamed to that name (`Gbrain::Client`) so
- * name-keyed reads (code_callers, the walks) find it. With no nested match
- * Ruby goes on to ancestors and the top level, which the index cannot settle,
- * so the written name stays. When the caller's own file proved an outer scope
- * (`Gbrain::Result`), the edge carries that name, the inner scopes Ruby tries
- * first and the written form (edge_metadata.ruby_written): an inner scope
- * defined in another file wins, as in Ruby, and otherwise the file's proof
- * stands.
+ * Ruby constants the extractor could not settle in the caller's innermost
+ * scope (`Client.new` inside `module Gbrain`, with `Client` defined in another
+ * file) carry the scopes Ruby tries first (edge_metadata.ruby_nesting) and the
+ * constant as written (ruby_written). Ruby looks the constant's first segment
+ * up in each of those scopes, innermost first, before ancestors and the top
+ * level; the first scope whose class or module this source defines names it,
+ * and the edge takes that name (`Gbrain::Client`) so name-keyed reads
+ * (code_callers, the walks) find it. With no such scope the edge takes the
+ * extractor's own name (ruby_default): the written name, or the outer scope
+ * the caller's file proved.
  *
- * Only class and module chunks of the same source that every reader may see
- * count (not private, sealed, current), so no edge name depends on a page a
- * reader cannot read, and the edge stays a name: no resolved_chunk_id
- * pointing at another page. A caller that already has the edge under its
- * qualified spelling keeps that row and the relative one is dropped.
+ * Every walk recomputes this from the kept hand-off, and
+ * refreshRubyConstantEdges re-walks the edges whenever the source's Ruby
+ * definitions change, so a definer that turns private, is deleted or gains an
+ * inner namesake moves the edge back or on. Only class and module chunks of
+ * the same source that every reader may see count, so no edge name depends on
+ * a page a reader cannot read, and the edge stays a name: no resolved_chunk_id
+ * pointing at another page. A renamed edge drops any within-file resolution
+ * stamped under its old name. A caller that already has the edge under the
+ * new name keeps that row and this one is dropped.
  */
 async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges: UnresolvedEdgeRow[]): Promise<void> {
   const lookups = edges.flatMap((edge) => {
-    const nesting = edge.edge_metadata?.ruby_nesting;
+    const meta = edge.edge_metadata;
+    const nesting = meta?.ruby_nesting;
     if (!Array.isArray(nesting)) return [];
-    // `Gbrain::Result.ok?` → constant `Gbrain::Result`, member `.ok?`; the written form wins when recorded.
-    const cut = edge.to_symbol_qualified.search(/[.#]/);
-    const member = cut === -1 ? '' : edge.to_symbol_qualified.slice(cut);
-    const recorded = edge.edge_metadata?.ruby_written;
-    const written = typeof recorded === 'string' ? recorded : edge.to_symbol_qualified.slice(0, cut === -1 ? undefined : cut);
-    return [{ edge, written, member, head: written.split('::')[0]!, nesting: nesting.filter((n): n is string => typeof n === 'string') }];
+    // `Gbrain::Result.ok?` → constant `Gbrain::Result`, member `.ok?`.
+    const fallback = typeof meta?.ruby_default === 'string' ? meta.ruby_default : edge.to_symbol_qualified;
+    const cut = fallback.search(/[.#]/);
+    const member = cut === -1 ? '' : fallback.slice(cut);
+    const written = typeof meta?.ruby_written === 'string' ? meta.ruby_written : fallback.slice(0, cut === -1 ? undefined : cut);
+    return [{ edge, fallback, written, member, head: written.split('::')[0]!, nesting: nesting.filter((n): n is string => typeof n === 'string') }];
   });
   if (lookups.length === 0) return;
   const names = [...new Set(lookups.flatMap((l) => l.nesting.map((cref) => `${cref}::${l.head}`)))];
@@ -339,30 +347,67 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE p.source_id = $1 AND cc.language = 'ruby' AND cc.symbol_type IN ('class', 'module')
         AND cc.symbol_name_qualified = ANY($2::text[])
-        AND ${codeReadFilter([], { excludePrivate: true, requireSafeChunks: true })}`,
+        AND ${RUBY_DEFINITION_FILTER}`,
     [sourceId, names],
   );
   const defined = new Set(rows.map((r) => r.symbol_name_qualified));
-  for (const { edge, written, member, head, nesting } of lookups) {
+  for (const { edge, fallback, written, member, head, nesting } of lookups) {
     const owner = nesting.find((cref) => defined.has(`${cref}::${head}`));
-    if (!owner) continue;
-    const renamed = `${owner}::${written}${member}`;
+    const target = owner ? `${owner}::${written}${member}` : fallback;
+    if (target === edge.to_symbol_qualified) continue;
     const updated = await engine.executeRaw<{ id: number }>(
       `UPDATE code_edges_symbol e
-          SET to_symbol_qualified = $1, edge_metadata = e.edge_metadata - 'ruby_nesting' - 'ruby_written'
+          SET to_symbol_qualified = $1,
+              edge_metadata = (e.edge_metadata - 'resolved_chunk_id' - 'ambiguous' - 'candidates')
+                              || jsonb_build_object('ruby_default', $3::text)
         WHERE e.id = $2
           AND NOT EXISTS (SELECT 1 FROM code_edges_symbol d
                            WHERE d.from_chunk_id = e.from_chunk_id AND d.to_symbol_qualified = $1 AND d.edge_type = e.edge_type)
         RETURNING e.id`,
-      [renamed, edge.id],
+      [target, edge.id, fallback],
     );
     if (updated.length > 0) {
-      edge.to_symbol_qualified = renamed;
+      edge.to_symbol_qualified = target;
+      edge.edge_metadata = { ...edge.edge_metadata, ruby_default: fallback };
+      for (const key of ['resolved_chunk_id', 'ambiguous', 'candidates']) delete edge.edge_metadata[key];
       continue;
     }
     await engine.executeRaw(`DELETE FROM code_edges_symbol WHERE id = $1`, [edge.id]);
     edges.splice(edges.indexOf(edge), 1);
   }
+}
+
+/** Config key holding the Ruby definitions a source's constant edges were last qualified against. */
+const rubyDefinitionsKey = (sourceId: string): string => `code_edges.ruby_definitions.${sourceId}`;
+
+/**
+ * Re-walk a source's Ruby constant edges when its Ruby class and module
+ * definitions change: a definer imported, deleted, turned private or unsealed,
+ * or a namesake added in an inner scope. The definitions are fingerprinted
+ * under the same reader filter qualifyRubyConstants uses; a fingerprint other
+ * than the one recorded clears edges_backfilled_at on every chunk of the
+ * source whose edges carry ruby_nesting, so this run's batches recompute
+ * them. The fingerprint is recorded after the reset, so an interrupted run
+ * resets again next time.
+ */
+async function refreshRubyConstantEdges(engine: BrainEngine, sourceId: string): Promise<void> {
+  const [row] = await engine.executeRaw<{ fingerprint: string }>(
+    // chunk-visibility-ok: Ruby class/module definitions: code pages are never segmented (chooseBodyStorage)
+    `SELECT md5(coalesce(string_agg(DISTINCT cc.symbol_name_qualified, ',' ORDER BY cc.symbol_name_qualified), '')) AS fingerprint
+       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+      WHERE p.source_id = $1 AND cc.language = 'ruby' AND cc.symbol_type IN ('class', 'module')
+        AND cc.symbol_name_qualified IS NOT NULL
+        AND ${RUBY_DEFINITION_FILTER}`,
+    [sourceId],
+  );
+  const key = rubyDefinitionsKey(sourceId);
+  if (!row || (await engine.getConfig(key)) === row.fingerprint) return;
+  await engine.executeRaw(
+    `UPDATE content_chunks SET edges_backfilled_at = NULL
+      WHERE id IN (SELECT from_chunk_id FROM code_edges_symbol WHERE source_id = $1 AND edge_metadata ? 'ruby_nesting')`,
+    [sourceId],
+  );
+  await engine.setConfig(key, row.fingerprint);
 }
 
 /**

@@ -560,9 +560,10 @@ function rubyCallContext(call: any): RubyCallContext | null {
 }
 
 /**
- * What a Ruby call resolves to. `nesting` (inner scopes still to try, innermost
- * first) and `written` (the relative constant as written, when `symbol` already
- * names an outer scope this file proves) ride along for the resolver.
+ * What a Ruby call resolves to. `nesting` (scopes still to try, innermost
+ * first) rides along for the resolver whenever the file cannot settle the
+ * constant in its innermost scope, with `written` (the relative constant as
+ * written) when `symbol` already names an outer scope this file proves.
  */
 export interface RubyCallee {
   symbol: string;
@@ -571,10 +572,11 @@ export interface RubyCallee {
 }
 
 const RUBY_PARAMETER_PARENTS = new Set([
-  'method_parameters', 'block_parameters', 'lambda_parameters', 'optional_parameter', 'splat_parameter',
-  'hash_splat_parameter', 'keyword_parameter', 'block_parameter', 'destructured_parameter',
+  'method_parameters', 'block_parameters', 'lambda_parameters', 'destructured_parameter',
   'left_assignment_list', 'destructured_left_assignment', 'rest_assignment', 'exception_variable',
 ]);
+/** Parameters that bind only their `name`: the default value of `x = helper` / `timeout: helper` is a read. */
+const RUBY_NAMED_PARAMETERS = new Set(['optional_parameter', 'keyword_parameter', 'splat_parameter', 'hash_splat_parameter', 'block_parameter']);
 
 const sameNode = (a: any, b: any): boolean => !!a && !!b && a.id === b.id;
 
@@ -583,6 +585,7 @@ function rubyBindsLocal(ident: any): boolean {
   const parent = ident.parent;
   if (!parent) return false;
   if (RUBY_PARAMETER_PARENTS.has(parent.type)) return true;
+  if (RUBY_NAMED_PARAMETERS.has(parent.type)) return sameNode(parent.childForFieldName('name'), ident);
   if (parent.type === 'assignment' || parent.type === 'operator_assignment') return sameNode(parent.childForFieldName('left'), ident);
   if (parent.type === 'for') return sameNode(parent.childForFieldName('pattern'), ident);
   for (let p = parent, child = ident; p; child = p, p = p.parent) {
@@ -600,6 +603,28 @@ function rubyReadsValue(ident: any): boolean {
   if (parent.type === 'call' && sameNode(parent.childForFieldName('method'), ident)) return false;
   if ((parent.type === 'method' || parent.type === 'singleton_method') && sameNode(parent.childForFieldName('name'), ident)) return false;
   return !rubyBindsLocal(ident);
+}
+
+/** True inside the operand of `defined?(...)`, which tests for a method or constant without calling it. */
+function rubyInsideDefined(node: any): boolean {
+  for (let p = node.parent, hops = 0; p && hops < WALK_DEPTH_CAP; p = p.parent, hops++) {
+    if (p.type === 'unary' && p.child(0)?.type === 'defined?') return true;
+    if (RUBY_SCOPE_GATES.has(p.type) || RUBY_BLOCKS.has(p.type)) return false;
+  }
+  return false;
+}
+
+/** `it` (Ruby 3.4) and `_1`..`_9` name the implicit parameter of the innermost block when it declares none. */
+function rubyImplicitBlockParameter(ident: any): boolean {
+  if (ident.text !== 'it' && !/^_[1-9]$/.test(ident.text)) return false;
+  for (let p = ident.parent, hops = 0; p && hops < WALK_DEPTH_CAP; p = p.parent, hops++) {
+    if (RUBY_SCOPE_GATES.has(p.type)) return false;
+    if (p.type === 'block' || p.type === 'do_block') {
+      const owner = p.parent?.type === 'lambda' ? p.parent : p;
+      return !owner.childForFieldName('parameters');
+    }
+  }
+  return false;
 }
 
 /** True when `scope` declares local `name` before byte `before`, outside nested blocks and scope gates. */
@@ -686,14 +711,19 @@ function rubyCalleeNames(call: any, callee: string): string[] {
  * subclass override or a method mixed in by `include`); a constant found
  * through ancestors (a superclass's nested constant) is not modeled; a
  * constant assigned (not `class`/`module`) in another file has no chunk, so
- * it keeps its written name; methods inside blocks (`Struct.new do`,
- * `class_methods do`) are not chunked.
+ * the resolver cannot see it: the edge keeps its written name, or takes an
+ * outer namesake class when one exists (`Client = Struct.new` inside
+ * Gbrain::Widget in one file, `class Gbrain::Client` in another, gives
+ * `Gbrain::Client` where Ruby finds `Gbrain::Widget::Client`); methods
+ * inside blocks (`Struct.new do`, `class_methods do`) are not chunked.
  *
  * A zero-argument call written without parentheses (`attempt { configuration }`)
  * parses as an identifier, which may equally be a local variable. `bareCall`
  * emits it only when Ruby's parse-time rule says it is not a local (no
- * assignment or parameter of that name earlier in its scope) and this file
- * defines the method there.
+ * assignment or parameter of that name earlier in its scope; a parameter's
+ * default value is a read, not a binding) and this file defines the method
+ * there. The operand of `defined?` is not a call, and `it` / `_1`..`_9` in a
+ * block that declares no parameters are its implicit parameter.
  *
  * Definitions are collected once per tree, from class and module bodies only
  * (not from blocks or method bodies), the same places the chunker emits
@@ -731,7 +761,7 @@ export class RubyScope {
   bareCall(ident: any): string | null {
     const name = ident.text as string;
     this.definitions();
-    if (!this.methodNames!.has(name) || !rubyReadsValue(ident)) return null;
+    if (!this.methodNames!.has(name) || !rubyReadsValue(ident) || rubyInsideDefined(ident) || rubyImplicitBlockParameter(ident)) return null;
     const ctx = rubyCallContext(ident);
     const scope = ctx?.nesting[0];
     if (!scope || !ctx.self) return null;
@@ -924,7 +954,8 @@ export function extractCallEdges(tree: any, language: SupportedCodeLanguage): Ex
       const callee = extractCalleeName(node, cfg);
       // v0.34 W1: try receiver-type resolution. On success, emit the
       // qualified name; on miss, emit the bare token (pre-W1 behavior).
-      for (const name of callee && ruby ? rubyCalleeNames(node, callee) : callee ? [callee] : []) {
+      const names = !callee || (ruby && rubyInsideDefined(node)) ? [] : ruby ? rubyCalleeNames(node, callee) : [callee];
+      for (const name of names) {
         const rubyCallee = ruby ? ruby.qualify(node, name) : null;
         const qualified = ruby ? (rubyCallee?.symbol ?? null) : resolveReceiverType(node, language, name, fileBindings);
         out.push({

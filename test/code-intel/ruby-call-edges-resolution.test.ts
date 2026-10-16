@@ -208,8 +208,8 @@ end
         expect(await callees()).toEqual(['Acme::Client', 'Acme::Client#ping', 'Acme::Ledger.post', 'Widget.build']);
         const op: any = await handleToolCall(engine, 'code_callers', { symbol: 'Acme::Client#ping' });
         expect(op.callers.map((e: any) => e.from_symbol_qualified)).toEqual(['Acme::Dashboard#show']);
-        // A renamed edge is settled: it no longer asks the resolver to look it up.
-        expect(op.callers[0].edge_metadata.ruby_nesting).toBeUndefined();
+        // A renamed edge keeps its hand-off, so a later change of definitions can move it again.
+        expect(op.callers[0].edge_metadata).toMatchObject({ ruby_nesting: ['Acme::Dashboard', 'Acme'], ruby_default: 'Client#ping' });
       });
 
       test('the innermost scope wins when several define the constant (Ruby lookup order)', async () => {
@@ -250,6 +250,63 @@ end
         await importLib('app/models/acme/widget.rb', OWN, { force: true });
         await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
         expect(await widgetCallees()).toEqual(['Acme::Widget::Client.fetch']);
+      });
+
+      describe('a change of definitions after the caller resolved re-qualifies it', () => {
+        const CLIENT = 'module Acme\n  class Client\n    def ping; end\n  end\nend\n';
+        const clientCallees = async () => (await callees()).filter((n) => n.includes('Client'));
+        const resolveAll = () => resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+
+        test('the definer turns private: the edge goes back to the written name', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Acme::Client', 'Acme::Client#ping']);
+          await engine.executeRaw(`UPDATE pages SET frontmatter = frontmatter || '{"visibility":"private"}'::jsonb WHERE slug LIKE 'lib%client%'`);
+          await engine.executeRaw(`UPDATE pages SET text_projection_revision = knowledge_revision WHERE slug LIKE 'lib%client%'`);
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Client', 'Client#ping']);
+        });
+
+        test('the definer is deleted: the edge goes back to the written name', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          await engine.softDeletePage('lib-acme-client-rb', { sourceId: 'default' });
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Client', 'Client#ping']);
+        });
+
+        test('an inner namesake added later wins', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          await importLib('lib/acme/dashboard/client.rb', 'class Acme::Dashboard::Client\n  def ping; end\nend\n');
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Acme::Dashboard::Client', 'Acme::Dashboard::Client#ping']);
+        });
+
+        test('a renamed edge drops the within-file resolution stamped under its old name', async () => {
+          // The caller's file defines a top-level Client, so `Client.fetch` first resolves within the file.
+          await importLib('app/models/acme/report.rb',
+            'class Client\n  def self.fetch(x); end\nend\n\nmodule Acme\n  class Report\n    def show\n      Client.fetch(1)\n    end\n  end\nend\n');
+          await resolveAll();
+          const edge = async () => (await engine.getCalleesOf('Acme::Report#show', { sourceId: 'default' }))[0]!;
+          expect((await edge()).resolved).toBe(true);
+          await importLib('lib/acme/client.rb', 'class Acme::Client\n  def self.fetch(x); end\nend\n');
+          await resolveAll();
+          expect((await edge()).to_symbol_qualified).toBe('Acme::Client.fetch');
+          expect((await edge()).resolved).toBe(false);
+        });
+
+        test('a definer added after the caller resolved qualifies it', async () => {
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Client', 'Client#ping']);
+          await importLib('lib/acme/client.rb', CLIENT);
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Acme::Client', 'Acme::Client#ping']);
+        });
       });
 
       test('a caller that also spells the constant in full keeps one edge', async () => {
