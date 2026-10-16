@@ -150,8 +150,9 @@ export const CHUNKER_VERSION = 8;
  * lua 1: tree-sitter-grammars v0.3.0 replaced a build whose scanner ran every
  * parse after the first on uninitialized state; Lua defs now become chunks.
  * typescript/tsx/javascript/python/ruby 1 (#5001): top-level call statements become `__module__` chunks (code-module-chunks.ts).
+ * ruby 2: `def self.m` qualifies as `Class.m`, and call edges carry the receiver's qualified name (RubyScope).
  */
-export const GRAMMAR_REVISIONS: Partial<Record<SupportedCodeLanguage, number>> = { lua: 1, typescript: 1, tsx: 1, javascript: 1, python: 1, ruby: 1 };
+export const GRAMMAR_REVISIONS: Partial<Record<SupportedCodeLanguage, number>> = { lua: 1, typescript: 1, tsx: 1, javascript: 1, python: 1, ruby: 2 };
 /** The `sources.chunker_version` gate value: a change forces the next sync to walk every file (hash compare, no re-import of unchanged hashes). */
 export const chunkerStamp = (): string => [String(CHUNKER_VERSION), ...Object.entries(GRAMMAR_REVISIONS).map(([lang, rev]) => `${lang}=${rev}`)].join(';');
 
@@ -1208,6 +1209,8 @@ function buildChunk(input: {
   index: number;
   /** v0.20.0 Cathedral II Layer 6: non-empty when nested inside a parent. */
   parentSymbolPath?: string[];
+  /** Ruby `def self.m` leaf (qualified-names.ts: `Class.m`, not `Class#m`). */
+  singleton?: boolean;
 }): CodeChunk {
   const symbol = input.symbolName ? `${input.symbolType} ${input.symbolName}` : input.symbolType;
   const parentPath = input.parentSymbolPath && input.parentSymbolPath.length > 0
@@ -1221,6 +1224,7 @@ function buildChunk(input: {
     symbolName: input.symbolName,
     symbolType: input.symbolType,
     parentSymbolPath: input.parentSymbolPath ?? [],
+    singleton: input.singleton,
   });
   return {
     index: input.index,
@@ -1351,6 +1355,7 @@ function emitNestedScoped(
       endLine: leaf.endPosition.row + 1,
       index: chunks.length,
       parentSymbolPath: newParentPath,
+      singleton: leaf.type === 'singleton_method',
     }));
   }
 }

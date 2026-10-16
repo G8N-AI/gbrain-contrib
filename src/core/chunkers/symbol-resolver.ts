@@ -70,8 +70,10 @@ import { chunkVisibleFilter } from '../search/safe-chunks.ts';
  * 2026-05-14T01:00:00Z — v0.34 W2: edge-extractor now emits `imports`
  * and `references` edges alongside calls. JS/TS/TSX + Python get imports;
  * TS only gets references.
+ * 2026-10-16T00:00:00Z — Ruby calls carry the receiver's qualified name
+ * (`A::B.m`, `A::B#m`), matching Ruby chunk identities.
  */
-export const EDGE_EXTRACTOR_VERSION_TS = '2026-05-14T01:00:00Z';
+export const EDGE_EXTRACTOR_VERSION_TS = '2026-10-16T00:00:00Z';
 
 export const BATCH_SIZE = 200;
 
