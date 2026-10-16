@@ -133,7 +133,7 @@ export async function resolveSymbolEdgesIncremental(
     ms: 0,
   };
 
-  await refreshRubyConstantEdges(engine, opts.sourceId);
+  const startedFrom = await refreshRubyConstantEdges(engine, opts.sourceId);
 
   let processed = 0;
   while (processed < maxChunks) {
@@ -182,6 +182,7 @@ export async function resolveSymbolEdgesIncremental(
     }
   }
 
+  await settleRubyConstantEdges(engine, opts.sourceId, startedFrom);
   stats.ms = Date.now() - start;
   return stats;
 }
@@ -368,8 +369,6 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
     );
     if (updated.length > 0) {
       edge.to_symbol_qualified = target;
-      edge.edge_metadata = { ...edge.edge_metadata, ruby_default: fallback };
-      for (const key of ['resolved_chunk_id', 'ambiguous', 'candidates']) delete edge.edge_metadata[key];
       continue;
     }
     await engine.executeRaw(`DELETE FROM code_edges_symbol WHERE id = $1`, [edge.id]);
@@ -380,17 +379,8 @@ async function qualifyRubyConstants(engine: BrainEngine, sourceId: string, edges
 /** Config key holding the Ruby definitions a source's constant edges were last qualified against. */
 const rubyDefinitionsKey = (sourceId: string): string => `code_edges.ruby_definitions.${sourceId}`;
 
-/**
- * Re-walk a source's Ruby constant edges when its Ruby class and module
- * definitions change: a definer imported, deleted, turned private or unsealed,
- * or a namesake added in an inner scope. The definitions are fingerprinted
- * under the same reader filter qualifyRubyConstants uses; a fingerprint other
- * than the one recorded clears edges_backfilled_at on every chunk of the
- * source whose edges carry ruby_nesting, so this run's batches recompute
- * them. The fingerprint is recorded after the reset, so an interrupted run
- * resets again next time.
- */
-async function refreshRubyConstantEdges(engine: BrainEngine, sourceId: string): Promise<void> {
+/** The source's visible Ruby class/module names, fingerprinted under the reader filter qualifyRubyConstants uses. */
+async function rubyDefinitionsFingerprint(engine: BrainEngine, sourceId: string): Promise<string | undefined> {
   const [row] = await engine.executeRaw<{ fingerprint: string }>(
     // chunk-visibility-ok: Ruby class/module definitions: code pages are never segmented (chooseBodyStorage)
     `SELECT md5(coalesce(string_agg(DISTINCT cc.symbol_name_qualified, ',' ORDER BY cc.symbol_name_qualified), '')) AS fingerprint
@@ -400,14 +390,44 @@ async function refreshRubyConstantEdges(engine: BrainEngine, sourceId: string): 
         AND ${RUBY_DEFINITION_FILTER}`,
     [sourceId],
   );
+  return row?.fingerprint;
+}
+
+/**
+ * Re-walk a source's Ruby constant edges when its Ruby class and module
+ * definitions change: a definer imported, deleted, turned private or unsealed,
+ * or a namesake added in an inner scope. A fingerprint other than the one
+ * recorded clears edges_backfilled_at on every chunk of the source whose edges
+ * carry ruby_nesting, so this run's batches recompute them. The fingerprint is
+ * recorded after the reset, so an interrupted run resets again next time.
+ * Returns the fingerprint this run starts from.
+ *
+ * Follow-up, not built: reset only the chunks whose edges name a head segment
+ * the change touched, instead of every chunk carrying ruby_nesting.
+ */
+async function refreshRubyConstantEdges(engine: BrainEngine, sourceId: string): Promise<string | undefined> {
+  const fingerprint = await rubyDefinitionsFingerprint(engine, sourceId);
   const key = rubyDefinitionsKey(sourceId);
-  if (!row || (await engine.getConfig(key)) === row.fingerprint) return;
+  if (fingerprint === undefined || (await engine.getConfig(key)) === fingerprint) return fingerprint;
   await engine.executeRaw(
     `UPDATE content_chunks SET edges_backfilled_at = NULL
       WHERE id IN (SELECT from_chunk_id FROM code_edges_symbol WHERE source_id = $1 AND edge_metadata ? 'ruby_nesting')`,
     [sourceId],
   );
-  await engine.setConfig(key, row.fingerprint);
+  await engine.setConfig(key, fingerprint);
+  return fingerprint;
+}
+
+/**
+ * Two runs on one source can overlap (the cycle phase and `gbrain
+ * edges-backfill` take no common lock): a batch that read the definitions
+ * before they changed can commit its names and watermark after another run
+ * reset the chunks and recorded the new fingerprint. So a run whose
+ * definitions changed while it ran clears the recorded fingerprint, and the
+ * next run resets and recomputes every Ruby constant edge.
+ */
+async function settleRubyConstantEdges(engine: BrainEngine, sourceId: string, startedFrom: string | undefined): Promise<void> {
+  if ((await rubyDefinitionsFingerprint(engine, sourceId)) !== startedFrom) await engine.unsetConfig(rubyDefinitionsKey(sourceId));
 }
 
 /**

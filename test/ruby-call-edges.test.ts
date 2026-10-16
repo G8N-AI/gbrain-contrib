@@ -367,6 +367,10 @@ end
 });
 
 describe('Ruby parameter defaults and implicit block parameters', () => {
+  test('nothing inside defined? is a call, receiver or method', async () => {
+    expect(await callees(parenless('defined?(helper.size)'))).toEqual([]);
+  });
+
   test('a parameter default is a call; only the parameter name is bound', async () => {
     const src = `class Widget
   def run(x = helper, timeout: limit)
@@ -387,13 +391,14 @@ end
     [1].map { _1 }
     -> { it }
     [1].map { |y| it }
+    ->(x) { it }
   end
 
   def it; end
   def _1; end
 end
 `;
-    expect(await callees(src)).toEqual(['Widget#it', 'map~', 'map~', 'map~']);
+    expect(await callees(src)).toEqual(['Widget#it', 'Widget#it', 'map~', 'map~', 'map~']);
   });
 });
 

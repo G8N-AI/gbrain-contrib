@@ -299,6 +299,61 @@ end
           expect((await edge()).resolved).toBe(false);
         });
 
+        test('an unchanged source re-walks nothing', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          expect((await resolveAll()).chunks_walked).toBe(0);
+        });
+
+        test('a definition change in another source re-walks nothing here', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          await engine.executeRaw(`INSERT INTO sources (id, name, local_path, config, created_at) VALUES ('ruby-other', 'ruby-other', '/fake/ruby-other', '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING`);
+          await importLib('lib/acme/ledger.rb', 'class Acme::Ledger\n  def self.post(x); end\nend\n', { sourceId: 'ruby-other' });
+          expect((await resolveAll()).chunks_walked).toBe(0);
+        });
+
+        test('overlapping runs: a batch that read the definer before it turned private does not keep the stale name', async () => {
+          await importLib('lib/acme/client.rb', CLIENT);
+          await importLib('app/models/acme/dashboard.rb', CALLER);
+          await resolveAll();
+          await importLib('app/models/acme/dashboard.rb', CALLER, { force: true });
+          // Run A walks the caller against the public definer. Before A stamps the watermark, the
+          // definer turns private and run B's refresh resets the caller and records the new fingerprint.
+          let fired = false;
+          const raceInto = (tx: BrainEngine): BrainEngine => new Proxy(tx, {
+            get(target, key) {
+              if (key === 'executeRaw') {
+                return async (sql: string, params?: unknown[]) => {
+                  if (!fired && /SET edges_backfilled_at = NOW\(\)/.test(sql)) {
+                    fired = true;
+                    await target.executeRaw(`UPDATE pages SET frontmatter = frontmatter || '{"visibility":"private"}'::jsonb WHERE slug LIKE 'lib%client%'`);
+                    await target.executeRaw(`UPDATE pages SET text_projection_revision = knowledge_revision WHERE slug LIKE 'lib%client%'`);
+                    await resolveSymbolEdgesIncremental(target, { sourceId: 'default', maxChunks: 0 });
+                  }
+                  return target.executeRaw(sql, params as never);
+                };
+              }
+              const value = Reflect.get(target, key);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          const runA = new Proxy(engine, {
+            get(target, key) {
+              if (key === 'transaction') return (fn: (tx: BrainEngine) => Promise<unknown>) => target.transaction((tx) => fn(raceInto(tx)));
+              const value = Reflect.get(target, key);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          await resolveSymbolEdgesIncremental(runA, { sourceId: 'default' });
+          expect(fired).toBe(true);
+          expect(await clientCallees()).toEqual(['Acme::Client', 'Acme::Client#ping']);
+          await resolveAll();
+          expect(await clientCallees()).toEqual(['Client', 'Client#ping']);
+        });
+
         test('a definer added after the caller resolved qualifies it', async () => {
           await importLib('app/models/acme/dashboard.rb', CALLER);
           await resolveAll();
